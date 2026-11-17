@@ -179,11 +179,11 @@
       el('div', null,
         el('span', { class: 'kicker', text: 'PRE-TOKEN PROTOCOLS · ' + DATA.as_of }),
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by what their token would be worth' }),
-        el('p', { class: 'lede', text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols below that floor. Implied value is a model calibrated on the live-token protocols in the same snapshot — not a promise, and not a price.' }),
+        el('p', { class: 'lede', text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols the watchlist missed — ' + DATA.early_above_floor + ' of them above that floor. Implied value is a model calibrated on the live-token protocols in the same snapshot — not a promise, and not a price.' }),
         el('div', { class: 'facts' },
           el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
           el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-          el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
+          el('div', { class: 'fact' }, el('span', { text: 'Early rows beyond the watchlist' }), el('b', { text: String(DATA.early_size) })),
           el('div', { class: 'fact' }, el('span', { text: 'Live-token comps behind the model' }), el('b', { text: String(DATA.calibration.comps_total) }))
         )
       ),
@@ -352,6 +352,7 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max + ')) )'
       ),
+      el('p', { class: 'fit' }, 'How well does one median per sector fit the market? On the ' + cal.comps_total + ' live-token protocols the multiples are calibrated from, the model’s implied value lands a median ' + DATA.fit.median_abs_pct_error + '% from the actual market cap, and ' + DATA.fit.within_2x_count + ' of ' + DATA.fit.comps + ' (' + Math.round(DATA.fit.within_2x_share * 100) + '%) land within twice their market cap. That is an in-sample fit — the same protocols set the multiples — and it is the honest spread of a one-number-per-sector model: the board is a ranking, not a price.'),
       el('table', { class: 'calib' },
         el('caption', { class: 'sub', text: 'Calibration: median mcap/TVL per sector, from ' + cal.comps_total + ' live-token protocols in the snapshot.' }),
         el('thead', null, el('tr', null, el('th', { text: 'Sector' }), el('th', { class: 'num', text: 'Multiple' }), el('th', { class: 'num', text: 'Live comps' }))),
@@ -394,7 +395,8 @@
         el('div', null, el('span', { text: 'Chains (' + (row.chains || []).length + ')' }), el('b', { text: 'x' + row.chain_multiplier })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+      el('p', { class: 'sub', text: 'Across the ' + DATA.fit.comps + ' live protocols the model is calibrated on, its implied value lands within twice the market cap for ' + Math.round(DATA.fit.within_2x_share * 100) + '% — the board ranks, it does not price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
