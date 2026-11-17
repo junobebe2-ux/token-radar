@@ -30,15 +30,13 @@
   function fmtMult(n) {
     return n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '') + 'x';
   }
-  // The model in one function: the page recomputes a row from the snapshot figures and checks the
+  // The model in one function: the page recomputes a row from the fitted regression and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    var chainMult = 1 + model.chain_step * Math.min(Math.max((row.chains || []).length - 1, 0), model.chain_max);
-    return Math.max(1, Math.round(row.tvl_usd * row.multiple * growthMult * maturity * chainMult));
+  // The row carries the fitted coefficients and its own log inputs, so this is the same doubles the
+  // build used, and the recompute matches board.json exactly.
+  function impliedOf(row) {
+    var predicted = row.intercept + row.log_tvl_slope * row.log_tvl + row.log_chains_slope * row.log_chains;
+    return Math.max(1, Math.round(Math.exp(predicted)));
   }
 
   function el(tag, attrs) {
@@ -142,12 +140,12 @@
     var top = DATA.rows.slice(0, 12);
     var svg = svgEl('svg', { viewBox: '0 0 340 340', role: 'img', 'aria-label': 'Radar plot of the top 12 pre-token protocols by implied value' });
     var cx = 170, cy = 170;
-    var logMin = Math.log10(500000), logMax = Math.log10(600000000);
+    var logMin = Math.log10(500000), logMax = Math.log10(60000000);
     function radius(implied) {
       var t = (Math.log10(Math.max(implied, 500000)) - logMin) / (logMax - logMin);
       return 22 + 128 * Math.max(0, Math.min(1, t));
     }
-    [500000000, 100000000, 10000000, 1000000].forEach(function (v) {
+    [50000000, 10000000, 5000000, 1000000].forEach(function (v) {
       svg.appendChild(svgEl('circle', { cx: cx, cy: cy, r: radius(v), fill: 'none', stroke: '#d9d4c3', 'stroke-width': 1 }));
     });
     svg.appendChild(svgEl('line', { x1: cx - 152, y1: cy, x2: cx + 152, y2: cy, stroke: '#d9d4c3', 'stroke-width': 1 }));
@@ -170,7 +168,7 @@
     });
     svg.appendChild(svgEl('circle', { cx: cx, cy: cy, r: 4, fill: '#182019' }));
     return el('div', { class: 'radar' }, svg,
-      el('p', { class: 'cap', text: 'Top 12 pre-token protocols. Distance from the centre is implied value (log scale); rings mark $1M, $10M, $100M and $500M. Amber is the top pick.' }));
+      el('p', { class: 'cap', text: 'Top 12 pre-token protocols. Distance from the centre is implied value (log scale); rings mark $1M, $5M, $10M and $50M. Amber is the top pick.' }));
   }
 
   function hero() {
@@ -193,7 +191,7 @@
 
   function pickStrip() {
     var top = DATA.rows[0];
-    var why = 'TVL ' + fmtUsd(top.tvl_usd) + ' on ' + (top.chains || []).length + ' chains, listed ' + fmtAge(top.age_days) + ' ago with no token. At the market median of ' + fmtMult(DATA.calibration.global_multiple) + ' of TVL it is worth about ' + fmtUsd(top.implied_value_usd) + '.';
+    var why = 'TVL ' + fmtUsd(top.tvl_usd) + ' on ' + (top.chains || []).length + ' chains, listed ' + fmtAge(top.age_days) + ' ago with no token. The fitted log-log model — market cap grows as TVL^' + DATA.calibration.log_tvl_slope.toFixed(2) + ', not in proportion — puts it at about ' + fmtUsd(top.implied_value_usd) + '.';
     return el('section', { class: 'pick', 'aria-label': 'Top pick' },
       el('span', { class: 'rank', text: '#1' }),
       el('div', null,
@@ -322,7 +320,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'The live-token protocols the multiples are calibrated on, largest market cap first. Their market caps are facts, not a model — and the median of their mcap/TVL ratios is what the pre-token board is priced at.' }),
+          el('caption', { class: 'sub', text: 'The live-token protocols the log-log fit is calibrated on, largest market cap first. Their market caps are facts, not a model — the fitted line through them is what the pre-token board is priced on.' }),
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Status' }), el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: '7d' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'mcap / TVL' }), el('th', { scope: 'col', text: 'Token' }))),
           tbody
         )
@@ -331,36 +329,46 @@
   }
 
   function methodPanel() {
-    var m = DATA.model;
     var cal = DATA.calibration;
     var topLive = DATA.live.length > 0 ? DATA.live[0].mcap_usd : null;
     var topImplied = DATA.rows.length > 0 ? DATA.rows[0].implied_value_usd : 0;
-    var calibRows = [el('tr', null,
-      el('td', { text: 'All sectors (market median)' }),
-      el('td', { class: 'num', text: fmtMult(cal.global_multiple) }),
-      el('td', { class: 'num', text: String(cal.comps_total) })
-    )].concat(cal.sectors.map(function (s) {
-      return el('tr', null,
-        el('td', { text: s.category }),
-        el('td', { class: 'num', text: fmtMult(s.multiple) }),
-        el('td', { class: 'num', text: String(s.comps) })
-      );
-    }));
+    var fitRows = [
+      el('tr', null,
+        el('td', { text: 'Intercept — log market cap at log TVL 0, log chains 0' }),
+        el('td', { class: 'num', text: cal.intercept.toFixed(4) })
+      ),
+      el('tr', null,
+        el('td', { text: 'Slope on log(TVL) — market cap scales as TVL to this power' }),
+        el('td', { class: 'num', text: cal.log_tvl_slope.toFixed(4) })
+      ),
+      el('tr', null,
+        el('td', { text: 'Slope on log(chains) — the chains term, holding TVL fixed' }),
+        el('td', { class: 'num', text: cal.log_chains_slope.toFixed(4) })
+      ),
+      el('tr', null,
+        el('td', { text: 'R-squared in log space — the share of log market-cap variance TVL and chains explain' }),
+        el('td', { class: 'num', text: cal.r_squared_log.toFixed(4) })
+      ),
+      el('tr', null,
+        el('td', { text: 'Live-token protocols the fit is calibrated on' }),
+        el('td', { class: 'num', text: String(cal.comps_total) })
+      )
+    ];
     return el('section', { class: 'panel method' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', null, 'Every row is scored by one function of the snapshot figures. The multiple is not asserted: it is the median market-cap/TVL ratio of the live-token protocols in this same snapshot. A sector gets its own multiple only where at least ', el('b', { text: String(m.min_comps) + ' live protocols' }), ' in that sector trade; a sector with fewer falls back to the market median. No protocol name is special-cased, and no row is hand-picked.'),
+      el('p', null, 'Every row is scored by one fitted regression of the snapshot figures. The fit is log(market cap) = a + b · log(TVL) + c · log(chains), fitted by ordinary least squares over the ', el('b', { text: String(cal.comps_total) + ' live-token protocols' }), ' in this same snapshot that already trade. Market cap grows as TVL^' + cal.log_tvl_slope.toFixed(2) + ', not in proportion: a protocol ten times larger in TVL is worth about two and a half times as much, not ten times. Holding TVL fixed, more chains slightly lowers the fitted value: TVL spread thin across chains is worth less per dollar. No protocol name is special-cased, and no row is hand-picked.'),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max + ')) )'
+        'implied = round( exp( ' + cal.intercept.toFixed(4) + ' + ' + cal.log_tvl_slope.toFixed(4) + ' x ln(tvl_usd) ' + (cal.log_chains_slope >= 0 ? '+ ' : '- ') + Math.abs(cal.log_chains_slope).toFixed(4) + ' x ln(chains) ) )'
       ),
-      el('p', { class: 'fit' }, 'How well does one median per sector fit the market? On the ' + cal.comps_total + ' live-token protocols the multiples are calibrated from, the model’s implied value lands a median ' + DATA.fit.median_abs_pct_error + '% from the actual market cap, and ' + DATA.fit.within_2x_count + ' of ' + DATA.fit.comps + ' (' + Math.round(DATA.fit.within_2x_share * 100) + '%) land within twice their market cap. That is an in-sample fit — the same protocols set the multiples — and it is the honest spread of a one-number-per-sector model: the board is a ranking, not a price.'),
+      el('p', { class: 'fit' }, 'How well does the fit explain the market? On the ' + cal.comps_total + ' live-token protocols it is fitted on, the model’s implied value lands a median ' + DATA.fit.median_abs_pct_error + '% from the actual market cap, and ' + DATA.fit.within_2x_count + ' of ' + DATA.fit.comps + ' (' + Math.round(DATA.fit.within_2x_share * 100) + '%) land within twice their market cap. TVL and chains explain only ' + Math.round(cal.r_squared_log * 100) + '% of the variance in log market cap (R² ' + cal.r_squared_log.toFixed(2) + '): token prices are driven by tokenomics, unlocks and hype, none of which are in the snapshot’s ten fields. That is an in-sample fit — the same protocols set the coefficients — and it is the honest spread of a two-variable model: the board is a ranking, not a price.'),
       el('table', { class: 'calib' },
-        el('caption', { class: 'sub', text: 'Calibration: median mcap/TVL per sector, from ' + cal.comps_total + ' live-token protocols in the snapshot.' }),
-        el('thead', null, el('tr', null, el('th', { text: 'Sector' }), el('th', { class: 'num', text: 'Multiple' }), el('th', { class: 'num', text: 'Live comps' }))),
-        el('tbody', null, calibRows)
+        el('caption', { class: 'sub', text: 'The fitted regression: coefficients from ' + cal.comps_total + ' live-token protocols in the snapshot, fitted at build time.' }),
+        el('thead', null, el('tr', null, el('th', { text: 'Term' }), el('th', { class: 'num', text: 'Value' }))),
+        el('tbody', null, fitRows)
       ),
       el('ul', { class: 'rules' },
-        el('li', null, el('b', { text: 'Age is the time since first listing' }), ' — the best record of how long a protocol has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.'),
-        el('li', null, el('b', { text: 'Size needs no extra factor' }), ' — the base already scales with TVL, so a second size bonus would double-count it.'),
+        el('li', null, el('b', { text: 'Sub-linear scaling is the finding, not an assumption' }), ' — a plain ratio model (market cap in proportion to TVL) fits worse, with a median error of 91%; the log-log fit cuts it to ' + DATA.fit.median_abs_pct_error + '%.'),
+        el('li', null, el('b', { text: 'Age and seven-day growth are not in the model' }), ' — they are shown on each row and they shape the farm plan, but the fit found they do not add signal once TVL and chains are in.'),
         el('li', null, el('b', { text: 'Bridges, liquid-staking receipts and other wrapped products are not ranked' }), ' — they are not waiting on a token of their own. The same kind test the watchlist applies at its floor is applied below it.'),
         el('li', null, el('b', { text: 'Sanity check' }), ' — the strongest implied value on the board is ' + fmtUsd(topImplied) + (topLive ? ', against the largest live market cap in the snapshot, ' + fmtUsd(topLive) + '. The model’s top sits inside the range the market already pays.' : '.'))
       )
@@ -376,7 +384,7 @@
     state.selected = slug;
     writeHash();
     dialog.textContent = '';
-    var recomputed = impliedOf(row, DATA.model);
+    var recomputed = impliedOf(row);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
         el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size }),
@@ -389,14 +397,14 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Multiple (' + row.multiple_source + ')' }), el('b', { text: fmtMult(row.multiple) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { text: fmtPct(row.change_7d) + ' (x' + row.growth_multiplier + ')' })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { text: fmtAge(row.age_days) + ' (x' + row.maturity_multiplier + ')' })),
-        el('div', null, el('span', { text: 'Chains (' + (row.chains || []).length + ')' }), el('b', { text: 'x' + row.chain_multiplier })),
+        el('div', null, el('span', { text: 'log(TVL)' }), el('b', { text: row.log_tvl.toFixed(4) })),
+        el('div', null, el('span', { text: 'Chains (' + (row.chains || []).length + '), log(chains)' }), el('b', { text: row.log_chains.toFixed(4) })),
+        el('div', null, el('span', { text: 'Intercept + slopes' }), el('b', { text: row.intercept.toFixed(4) + ' + ' + row.log_tvl_slope.toFixed(4) + ' x ln(TVL) ' + (row.log_chains_slope >= 0 ? '+ ' : '- ') + Math.abs(row.log_chains_slope).toFixed(4) + ' x ln(chains)' })),
+        el('div', null, el('span', { text: 'Fitted log value' }), el('b', { text: row.predicted_log_value.toFixed(4) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
-      el('p', { class: 'sub', text: 'Across the ' + DATA.fit.comps + ' live protocols the model is calibrated on, its implied value lands within twice the market cap for ' + Math.round(DATA.fit.within_2x_share * 100) + '% — the board ranks, it does not price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same regression scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' }),
+      el('p', { class: 'sub', text: 'Across the ' + DATA.fit.comps + ' live protocols the regression is fitted on, its implied value lands within twice the market cap for ' + Math.round(DATA.fit.within_2x_share * 100) + '% — the board ranks, it does not price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),

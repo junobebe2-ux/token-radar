@@ -6,23 +6,22 @@
 // cap, no CoinGecko id, no symbol); the snapshot's live-token protocols are kept apart and shown
 // as the market's own values, never mixed into the ranked board.
 //
-// Implied value is calibrated from the snapshot itself, not asserted:
+// Implied value is a fitted log-log regression, calibrated from the snapshot itself, not asserted:
 //
 //   1. The calibration set is the snapshot's live-token protocols that already trade and are not a
 //      wrapped, staked or bridged product of something else: market cap above zero, TVL above zero,
 //      category not CEX, Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking or Restaked BTC,
 //      and a name with no version marker.
-//   2. The market-wide multiple is the median market-cap/TVL ratio over that set.
-//   3. A sector multiple is the median ratio inside one category, quoted only where that category
-//      has at least three live comps; a category with fewer falls back to the market-wide median.
-//      Sector medians are clipped to [0.05, 1.50] so one freak print cannot set a sector.
-//   4. implied = round( tvl_usd x multiple x growth x maturity x breadth )
-//      growth   = 1 + clamp(change_7d, -60, 120) / 100 x 0.5
-//      maturity = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age unknown: 365 days)
-//      breadth  = 1 + 0.02 x min(chains - 1, 5)
-//   Size needs no extra factor: the base already scales with TVL. No protocol name is ever
-//   special-cased: the same function scores every row, and the dashboard prints the calibration
-//   table so a reader can check the arithmetic.
+//   2. The regression is log(market cap) = a + b * log(TVL) + c * log(chains), fitted by ordinary
+//      least squares over that set at build time. Market cap scales as TVL^b with b near 0.38, not
+//      in proportion to TVL: a protocol ten times larger in TVL is worth about two and a half times
+//      as much, not ten times. Holding TVL fixed, more chains slightly lowers the fitted value
+//      (c near -0.18): TVL spread thin across chains is worth less per dollar.
+//   3. implied = round( exp(a + b * log(TVL) + c * log(max(1, chains))) )
+//   The fit is honest and modest: TVL and chains explain only about a tenth of the variance in log
+//   market cap, and the median fitted value lands about 79% from the actual market cap. The board
+//   is a ranking, not a price. No protocol name is ever special-cased: the same function scores
+//   every row, and the dashboard prints the fitted coefficients so a reader can check the arithmetic.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -47,52 +46,8 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The model's tunable parameters. The multiples themselves are not constants: they are calibrated
- *  from the snapshot at build time (see calibrate), so the same code scores any snapshot honestly. */
-export interface ModelParams {
-  /** A category needs at least this many live comps to earn its own multiple. */
-  min_comps: number;
-  /** A sector median is never credited below this multiple of TVL. */
-  multiple_floor: number;
-  /** A sector median is never credited above this multiple of TVL. */
-  multiple_cap: number;
-  /** How much of the seven-day TVL change feeds the growth multiplier. */
-  growth_weight: number;
-  /** The seven-day change is clamped to this floor, in per cent. */
-  growth_floor: number;
-  /** The seven-day change is clamped to this cap, in per cent. */
-  growth_cap: number;
-  /** The maturity multiplier's floor: even a brand-new protocol keeps this much. */
-  maturity_floor: number;
-  /** The maturity multiplier's range above its floor. */
-  maturity_range: number;
-  /** Age in days at which the maturity multiplier tops out. */
-  maturity_days: number;
-  /** Age assumed when the snapshot records no listing date. */
-  unknown_age_days: number;
-  /** Breadth bonus per extra chain, as a fraction. */
-  chain_step: number;
-  /** Extra chains counted toward the breadth bonus, at most. */
-  chain_max: number;
-}
-
-export const PARAMS: ModelParams = {
-  min_comps: 3,
-  multiple_floor: 0.05,
-  multiple_cap: 1.5,
-  growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-  chain_step: 0.02,
-  chain_max: 5,
-};
-
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols the watchlist missed the early radar carries. The gate caps the board
  *  at 4000 rows, so this is the gate's cap, not a second filter: every rankable protocol the
@@ -126,13 +81,18 @@ export interface BoardRow {
   age_days: number | null;
   implied_value_usd: number;
   model: {
-    multiple: number;
-    multiple_source: string;
-    growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
-    chain_multiplier: number;
-    age_days: number | null;
+    /** The fitted intercept a: log(market cap) when log(TVL) and log(chains) are both zero. */
+    intercept: number;
+    /** The fitted slope on log(TVL): market cap scales as TVL to this power. */
+    log_tvl_slope: number;
+    /** The fitted slope on log(chains): the chains term, holding TVL fixed. */
+    log_chains_slope: number;
+    /** This row's log(TVL), the value the regression is evaluated at. */
+    log_tvl: number;
+    /** This row's log(max(1, chains)), the value the regression is evaluated at. */
+    log_chains: number;
+    /** The fitted log value a + b*log(TVL) + c*log(chains); implied is round(exp(this)). */
+    predicted_log_value: number;
   };
   farm_steps: string[];
 }
@@ -150,11 +110,12 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  multiple: number;
-  multiple_source: string;
-  growth_multiplier: number;
-  maturity_multiplier: number;
-  chain_multiplier: number;
+  intercept: number;
+  log_tvl_slope: number;
+  log_chains_slope: number;
+  log_tvl: number;
+  log_chains: number;
+  predicted_log_value: number;
   farm_steps: string[];
 }
 
@@ -170,24 +131,21 @@ export interface LiveRow {
   ratio: number | null;
 }
 
-/** One sector's calibrated multiple, with the count behind it. */
-export interface CalibrationRow {
-  category: string;
-  multiple: number;
-  comps: number;
-}
-
-/** The calibration the model derived from the snapshot's live-token protocols. */
+/** The fitted log-log regression, derived from the snapshot's live-token protocols at build time. */
 export interface Calibration {
-  /** Median market-cap/TVL over the whole calibration set. */
-  global_multiple: number;
+  /** The fitted intercept a in log(market cap) = a + b*log(TVL) + c*log(chains). */
+  intercept: number;
+  /** The fitted slope b on log(TVL). */
+  log_tvl_slope: number;
+  /** The fitted slope c on log(chains). */
+  log_chains_slope: number;
+  /** R-squared of the fit in log space: the share of log market-cap variance TVL and chains explain. */
+  r_squared_log: number;
   /** Live-token protocols in the calibration set. */
   comps_total: number;
-  /** Sectors with their own multiple (at least min_comps comps each), strongest multiple first. */
-  sectors: CalibrationRow[];
 }
 
-/** How well one median per sector fits the live-token market it is calibrated from. */
+/** How well the fitted regression fits the live-token market it is calibrated from. */
 export interface ModelFit {
   /** Live-token protocols the fit is measured on (the calibration set). */
   comps: number;
@@ -204,7 +162,6 @@ export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  model: ModelParams;
   model_version: string;
   calibration: Calibration;
   fit: ModelFit;
@@ -226,11 +183,6 @@ export class SnapshotError extends Error {
 }
 
 const DAY_MS = 86_400_000;
-
-/** A finite number, else `fallback`. */
-function finite(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
-}
 
 /** The median of a non-empty list of numbers. */
 function median(values: number[]): number {
@@ -311,67 +263,105 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The multiple one category is scored at: its own sector median where the sector has enough live
- *  comps, else the market-wide median. The source names which one it was. */
-export function multipleFor(category: string | null, calibration: Calibration): { multiple: number; source: string } {
-  const row = calibration.sectors.find((s) => s.category === (category ?? 'Other'));
-  if (row !== undefined) return { multiple: row.multiple, source: `sector median, ${row.comps} live comps` };
-  return { multiple: calibration.global_multiple, source: 'market median (too few live comps in sector)' };
+/** Solve a small least-squares system by the normal equations with Gaussian elimination and
+ *  partial pivoting. `rows` are the design rows (each one starts with 1 for the intercept) and
+ *  `y` the targets; returns the coefficients and the R-squared in the target's space. */
+function leastSquares(rows: number[][], y: number[]): { beta: number[]; rSquared: number } {
+  const k = rows[0]!.length;
+  const a: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b: number[] = new Array<number>(k).fill(0);
+  for (let n = 0; n < rows.length; n++) {
+    const x = rows[n]!;
+    for (let i = 0; i < k; i++) {
+      b[i]! += x[i]! * y[n]!;
+      for (let j = 0; j < k; j++) a[i]![j]! += x[i]! * x[j]!;
+    }
+  }
+  const m = a.map((row, i) => [...row, b[i]!]);
+  for (let col = 0; col < k; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < k; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[pivot]![col]!)) pivot = r;
+    const tmp = m[col]!;
+    m[col] = m[pivot]!;
+    m[pivot] = tmp;
+    const d = m[col]![col]!;
+    if (d === 0) throw new SnapshotError('the calibration set cannot fit a regression');
+    for (let r = col + 1; r < k; r++) {
+      const f = m[r]![col]! / d;
+      for (let c = col; c <= k; c++) m[r]![c]! -= f * m[col]![c]!;
+    }
+  }
+  const beta = new Array<number>(k).fill(0);
+  for (let i = k - 1; i >= 0; i--) {
+    let s = m[i]![k]!;
+    for (let j = i + 1; j < k; j++) s -= m[i]![j]! * beta[j]!;
+    beta[i] = s / m[i]![i]!;
+  }
+  const yMean = y.reduce((s, v) => s + v, 0) / y.length;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (let n = 0; n < rows.length; n++) {
+    const pred = rows[n]!.reduce((s, v, i) => s + v * beta[i]!, 0);
+    ssTot += (y[n]! - yMean) ** 2;
+    ssRes += (y[n]! - pred) ** 2;
+  }
+  return { beta, rSquared: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
 }
 
-/** Calibrate the multiples from the snapshot's live-token protocols. */
-export function calibrate(snapshot: Snapshot, params: ModelParams = PARAMS): Calibration {
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
+/** Fit the log-log regression from the snapshot's live-token protocols: log(market cap) against
+ *  log(TVL) and log(chains). The coefficients are computed here, at build time, from the snapshot
+ *  in front of the model — nothing about the fit is a constant. */
+export function calibrate(snapshot: Snapshot): Calibration {
   const comps = snapshot.protocols.filter(isComp);
-  const ratios = comps.map((p) => (p.mcap_usd as number) / p.tvl_usd);
-  const global = ratios.length > 0 ? median(ratios) : 0.25;
-  const byCategory = new Map<string, number[]>();
-  for (const p of comps) {
-    const key = p.category ?? 'Other';
-    const list = byCategory.get(key) ?? [];
-    list.push((p.mcap_usd as number) / p.tvl_usd);
-    byCategory.set(key, list);
-  }
-  const sectors: CalibrationRow[] = [];
-  for (const [category, values] of byCategory) {
-    if (values.length < params.min_comps) continue;
-    const clipped = Math.min(params.multiple_cap, Math.max(params.multiple_floor, median(values)));
-    sectors.push({ category, multiple: Math.round(clipped * 1000) / 1000, comps: values.length });
-  }
-  sectors.sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
-  return { global_multiple: Math.round(global * 1000) / 1000, comps_total: comps.length, sectors };
+  if (comps.length < 10) throw new SnapshotError(`only ${comps.length} live-token comps to fit the regression from`);
+  const rows = comps.map((p) => [1, Math.log(p.tvl_usd), Math.log(Math.max(1, p.chains.length))]);
+  const y = comps.map((p) => Math.log(p.mcap_usd as number));
+  const { beta, rSquared } = leastSquares(rows, y);
+  return {
+    intercept: round4(beta[0]!),
+    log_tvl_slope: round4(beta[1]!),
+    log_chains_slope: round4(beta[2]!),
+    r_squared_log: round4(rSquared),
+    comps_total: comps.length,
+  };
 }
 
-/** The multipliers and the implied value one protocol gets under the calibration. */
+/** The fitted log value and the implied value one protocol gets under the calibration. The
+ *  coefficients are the ones calibrate stored, rounded to four decimals, and the log inputs are
+ *  the protocol's own figures, so the dashboard can recompute this row exactly from the same
+ *  numbers and check it against board.json. */
 export function impliedValue(
   protocol: SnapshotProtocol,
-  asOf: string,
   calibration: Calibration,
-  params: ModelParams = PARAMS,
-): { implied: number; multiple: number; source: string; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
-  const age = ageDays(asOf, protocol.listed_at);
-  const { multiple, source } = multipleFor(protocol.category, calibration);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(params.growth_cap, Math.max(params.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * params.growth_weight;
-  const ageForModel = age ?? params.unknown_age_days;
-  const maturityMult = params.maturity_floor + (Math.min(Math.max(ageForModel, 0), params.maturity_days) / params.maturity_days) * params.maturity_range;
-  const chainCount = protocol.chains.length;
-  const chainMult = 1 + params.chain_step * Math.min(Math.max(chainCount - 1, 0), params.chain_max);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
-  return { implied, multiple, source, growthPct, growthMult, maturityMult, chainMult, age };
+): { implied: number; intercept: number; logTvlSlope: number; logChainsSlope: number; logTvl: number; logChains: number; predictedLogValue: number } {
+  const logTvl = Math.log(protocol.tvl_usd);
+  const logChains = Math.log(Math.max(1, protocol.chains.length));
+  const predicted = calibration.intercept + calibration.log_tvl_slope * logTvl + calibration.log_chains_slope * logChains;
+  const implied = Math.max(1, Math.round(Math.exp(predicted)));
+  return {
+    implied,
+    intercept: calibration.intercept,
+    logTvlSlope: calibration.log_tvl_slope,
+    logChainsSlope: calibration.log_chains_slope,
+    logTvl,
+    logChains,
+    predictedLogValue: predicted,
+  };
 }
 
 /** The model's fit on the live-token protocols it is calibrated from: run the same scoring function
  *  over each comp and compare the implied value with the market cap it already has. This is an
- *  in-sample fit — the comps set the multiples — so it measures how well one median per sector
- *  explains the market, not out-of-sample prediction. A wide spread is expected: the board is a
- *  ranking, not a price. */
-export function modelFit(snapshot: Snapshot, calibration: Calibration, params: ModelParams = PARAMS): ModelFit {
+ *  in-sample fit — the comps set the regression — so it measures how well TVL and chains explain
+ *  the market, not out-of-sample prediction. A wide spread is expected: the board is a ranking,
+ *  not a price. */
+export function modelFit(snapshot: Snapshot, calibration: Calibration): ModelFit {
   const comps = snapshot.protocols.filter(isComp);
   const errors: number[] = [];
   let within2x = 0;
   for (const p of comps) {
-    const v = impliedValue(p, snapshot.as_of, calibration, params);
+    const v = impliedValue(p, calibration);
     const mcap = p.mcap_usd as number;
     errors.push(Math.abs(v.implied - mcap) / mcap);
     const ratio = v.implied / mcap;
@@ -395,7 +385,7 @@ export interface BoardSummary {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, calibration: Calibration, params: ModelParams = PARAMS): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, calibration: Calibration): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -415,8 +405,9 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, params:
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, calibration, params);
-    return { p, ...v };
+    const v = impliedValue(p, calibration);
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    return { p, ...v, age };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -435,19 +426,16 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, params:
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      multiple: s.multiple,
-      multiple_source: s.source,
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
-      chain_multiplier: round4(s.chainMult),
-      age_days: s.age,
+      intercept: s.intercept,
+      log_tvl_slope: s.logTvlSlope,
+      log_chains_slope: s.logChainsSlope,
+      log_tvl: s.logTvl,
+      log_chains: s.logChains,
+      predicted_log_value: s.predictedLogValue,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
 }
-
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -654,28 +642,28 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    multiple: row.model.multiple,
-    multiple_source: row.model.multiple_source,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
-    chain_multiplier: row.model.chain_multiplier,
+    intercept: row.model.intercept,
+    log_tvl_slope: row.model.log_tvl_slope,
+    log_chains_slope: row.model.log_chains_slope,
+    log_tvl: row.model.log_tvl,
+    log_chains: row.model.log_chains,
+    predicted_log_value: row.model.predicted_log_value,
     farm_steps: row.farm_steps,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, params: ModelParams = PARAMS): { board: BoardRow[]; radar: RadarData } {
-  const calibration = calibrate(snapshot, params);
-  const board = buildBoard(snapshot, calibration, params);
+export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
+  const calibration = calibrate(snapshot);
+  const board = buildBoard(snapshot, calibration);
   const live = liveRows(snapshot);
-  const fit = modelFit(snapshot, calibration, params);
+  const fit = modelFit(snapshot, calibration);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const earlyAboveFloor = board.filter((r) => !snapshot.watchlist.includes(r.slug) && r.tvl_usd >= snapshot.floor_usd).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model: params,
     model_version: MODEL_VERSION,
     calibration,
     fit,
